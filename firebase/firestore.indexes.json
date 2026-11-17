@@ -1,0 +1,11 @@
+{
+  "indexes": [
+    { "collectionGroup": "scores", "queryScope": "COLLECTION", "fields": [
+      { "fieldPath": "map", "order": "ASCENDING" }, { "fieldPath": "mode", "order": "ASCENDING" }, { "fieldPath": "score", "order": "DESCENDING" } ] },
+    { "collectionGroup": "scores", "queryScope": "COLLECTION", "fields": [
+      { "fieldPath": "uid", "order": "ASCENDING" }, { "fieldPath": "mode", "order": "ASCENDING" }, { "fieldPath": "pp", "order": "DESCENDING" } ] },
+    { "collectionGroup": "plays", "queryScope": "COLLECTION", "fields": [
+      { "fieldPath": "uid", "order": "ASCENDING" }, { "fieldPath": "date", "order": "DESCENDING" } ] }
+  ],
+  "fieldOverrides": []
+}
