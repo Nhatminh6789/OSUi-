@@ -1,0 +1,195 @@
+/* Osui! · Hệ thống chế độ mở rộng (plugin)
+   - Thêm file .dll (assembly osu!lazer ruleset) hoặc .js (adapter) trong Cài đặt → Thêm chế độ.
+   - Mọi chế độ thêm vào dùng chung: d-pad cố định / thả nổi, joystick analog, tay cầm (Gamepad API), nút Skip, Pause, chơi ngang.
+   - Trình duyệt không chạy được code .NET: .dll chỉ được đọc ảnh/âm thanh nhúng; luật chơi do adapter JS (ví dụ touhosu.js) đảm nhiệm.
+   Xem MODES.md để viết adapter cho chế độ mới. */
+(()=>{
+const LS='osui_om',K={on:'',ctl:'dpad',size:100,op:85,left:0,files:[],cfg:{}};
+try{Object.assign(K,JSON.parse(localStorage.getItem(LS)||'{}'))}catch(e){}
+const save=()=>{try{localStorage.setItem(LS,JSON.stringify(K))}catch(e){}};
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const latin=b=>{let s='';for(let i=0;i<b.length;i+=8192)s+=String.fromCharCode.apply(null,b.subarray(i,i+8192));return s};
+const OM=window.OM={adapters:{},assets:{},msg:'',K};
+OM.register=a=>{OM.adapters[a.id]=a;return a};
+const CTL=[['dpad','D-pad'],['float','D-pad thả nổi'],['stick','Joystick']];
+
+/* ---------- lưu file (IndexedDB) ---------- */
+const idb=()=>new Promise((res,rej)=>{const r=indexedDB.open('osui_modes',1);r.onupgradeneeded=()=>r.result.createObjectStore('f');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+const dbp=async(m,fn)=>{const d=await idb();return new Promise((res,rej)=>{const t=d.transaction('f',m),q=fn(t.objectStore('f'));t.oncomplete=()=>res(q&&q.result);t.onerror=()=>rej(t.error)})};
+const dPut=(k,v)=>dbp('readwrite',s=>s.put(v,k)),dGet=k=>dbp('readonly',s=>s.get(k)),dDel=k=>dbp('readwrite',s=>s.delete(k));
+
+/* ---------- đọc .dll: tên ruleset + ảnh/âm thanh nhúng ---------- */
+const CORE=/^(Scoring|Objects|UI|Mods|Judgements|Replays|Difficulty|Beatmaps|Configuration|Edit|Osu|Mania|Taiko|Catch|Scoring|Timing|Types|Skinning|Online|Filter)$/;
+function parseDll(b){
+ if(!(b[0]===77&&b[1]===90))throw Error('Không phải file .dll hợp lệ');
+ const s=latin(b),cnt={};let m;const re=/osu\.Game\.Rulesets\.([A-Za-z][A-Za-z0-9_]*)(\.[A-Za-z]|\b)/g;
+ while((m=re.exec(s)))if(!CORE.test(m[1]))cnt[m[1]]=(cnt[m[1]]||0)+(m[2]?1:.2);
+ const names=Object.keys(cnt).sort((a,c)=>cnt[c]-cnt[a]);
+ const len=i=>b[i-4]|b[i-3]<<8|b[i-2]<<16|b[i-1]<<24,pngs=[],audio=[];
+ const scan=(sig,fn)=>{let i=0;while((i=s.indexOf(sig,i))>=0){if(i>=4)fn(i,len(i));i+=sig.length}};
+ scan('\x89PNG\r\n\x1a\n',(i,L)=>{if(L>0&&L<4e6&&i+L<=b.length)pngs.push(b.slice(i,i+L))});
+ scan('ID3',(i,L)=>{if(L>200&&L<8e6&&i+L<=b.length)audio.push({type:'mp3',bytes:b.slice(i,i+L)})});
+ scan('OggS',(i,L)=>{if(L>200&&L<8e6&&i+L<=b.length)audio.push({type:'ogg',bytes:b.slice(i,i+L)})});
+ scan('RIFF',(i,L)=>{if(L>200&&L<8e6&&i+L<=b.length&&s.substr(i+8,4)==='WAVE')audio.push({type:'wav',bytes:b.slice(i,i+L)})});
+ return{names,name:names[0]||'',pngs,audio,bytes:b}}
+OM._parse=parseDll;
+const findAd=info=>{for(const id in OM.adapters){const a=OM.adapters[id];try{if(a.match?a.match(info):info.names.some(n=>n.toLowerCase()===(a.asm||a.id).split('.').pop().toLowerCase()))return a}catch(e){}}return null};
+
+/* ---------- plugin .js ---------- */
+function runPlugin(code){const before=new Set(Object.keys(OM.adapters));new Function('OM',code)(OM);return Object.keys(OM.adapters).filter(k=>!before.has(k))}
+async function mkMode(a,info){const A=await a.build(info);OM.assets[a.id]=A;let icon='';try{icon=(a.icon&&a.icon(A))||''}catch(e){}return{id:a.id,name:a.name,icon}}
+
+/* ---------- cài / gỡ ---------- */
+const fileEntry=n=>K.files.find(f=>f.n===n);
+OM.install=async file=>{OM.msg='';try{const n=file.name,js=/\.js$/i.test(n);let ent={n,kind:js?'js':'dll',modes:[]};
+  if(js){const code=await file.text(),ids=runPlugin(code);await dPut(n,code);
+   for(const id of ids){const a=OM.adapters[id];if(a.standalone)ent.modes.push(await mkMode(a,{names:[],pngs:[],audio:[],bytes:null}))}
+   OM.msg=ids.length?'Đã thêm plugin: '+ids.join(', '):'Plugin không đăng ký chế độ nào (OM.register)';
+   /* thử khớp lại các .dll đang chờ adapter */await matchPending()}
+  else{const b=new Uint8Array(await file.arrayBuffer()),info=parseDll(b),a=findAd(info);
+   if(!a){await dPut(n,b);ent.err='Nhận ra ruleset "'+(info.name||'?')+'" nhưng chưa có adapter. Thêm file adapter .js cho chế độ này.';OM.msg=ent.err}
+   else{await dPut(n,b);ent.modes.push(await mkMode(a,info));OM.msg=''}}
+  K.files=K.files.filter(f=>f.n!==n);K.files.push(ent);save()}
+ catch(e){OM.msg=e.message||'Lỗi'}refresh()};
+async function matchPending(){for(const f of K.files){if(f.kind!=='dll'||f.modes.length)continue;try{const b=await dGet(f.n),info=parseDll(b),a=findAd(info);if(a){f.modes.push(await mkMode(a,info));delete f.err}}catch(e){}}}
+OM.remove=async n=>{const f=fileEntry(n);if(!f)return;if(f.modes.some(m=>m.id===K.on))K.on='';K.files=K.files.filter(x=>x!==f);try{await dDel(n)}catch(e){}save();refresh()};
+
+/* ---------- khởi động: nạp lại file đã lưu ---------- */
+async function boot(){
+ try{const L=JSON.parse(localStorage.getItem('osui_th')||'null');if(L&&L.dll&&!K.files.length){const bin=atob(L.dll),b=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);
+   const info=parseDll(b),a=findAd(info);if(a){await dPut('osu.Game.Rulesets.Touhosu.dll',b);K.files.push({n:'osu.Game.Rulesets.Touhosu.dll',kind:'dll',modes:[await mkMode(a,info)]});K.cfg[a.id]={cnt:L.cnt||1,dim:L.dim==null?60:L.dim};if(L.on)K.on=a.id}
+   delete L.dll;localStorage.setItem('osui_th',JSON.stringify(L));save()}}catch(e){}
+ for(const f of [...K.files.filter(x=>x.kind==='js'),...K.files.filter(x=>x.kind!=='js')]){try{if(f.kind==='dll'){const b=await dGet(f.n);if(!b)continue;const info=parseDll(b),a=findAd(info);f.modes=[];if(a){f.modes.push(await mkMode(a,info));delete f.err}else f.err='Chưa có adapter cho "'+(info.name||'?')+'"'}
+   else{const ids=runPlugin(await dGet(f.n));f.modes=[];for(const id of ids)if(OM.adapters[id].standalone)f.modes.push(await mkMode(OM.adapters[id],{names:[],pngs:[],audio:[],bytes:null}))}}catch(e){f.err=e.message}}
+ save();refresh()}
+OM.ready=new Promise(r=>setTimeout(()=>boot().catch(()=>{}).then(r),0));
+
+/* ---------- danh sách chế độ ---------- */
+OM.list=()=>{const o=[];for(const f of K.files)for(const m of f.modes||[])if(OM.adapters[m.id]&&!o.find(x=>x.id===m.id))o.push(m);return o};
+OM.cur=()=>K.on&&OM.list().some(m=>m.id===K.on)?K.on:'';
+OM.set=id=>{K.on=id||'';save();if(id&&typeof setMania==='function')setMania(false)};
+OM.cfg=id=>{const a=OM.adapters[id],c=K.cfg[id]||(K.cfg[id]={});for(const s of(a&&a.settings)||[])if(c[s.k]==null)c[s.k]=s.def;return c};
+
+/* ---------- chơi ngang ---------- */
+const touchDev=()=>(typeof isPC==='function'?!isPC():true)||matchMedia('(pointer:coarse)').matches;
+OM.needRotate=()=>touchDev()&&innerHeight>innerWidth;
+OM.lock=()=>{try{const o=screen.orientation;if(o&&o.lock)o.lock('landscape').catch(()=>{})}catch(e){}};
+OM.rotate=(ok,back)=>{const o=document.createElement('div');o.style.cssText='position:fixed;inset:0;z-index:60;background:#0a0618f2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;color:#fff;font:bold 18px sans-serif;text-align:center;padding:20px';
+ o.innerHTML='<div style="font-size:64px;animation:omr 1.6s infinite alternate">📱</div><style>@keyframes omr{from{transform:rotate(0)}to{transform:rotate(-90deg)}}</style><div>Xoay ngang màn hình để chơi</div><button style="background:#444;color:#fff;border:0;border-radius:24px;padding:10px 26px;font:bold 16px sans-serif">Back</button>';
+ document.body.appendChild(o);let d=0;const off=()=>{if(d)return;d=1;o.remove();removeEventListener('resize',chk);removeEventListener('orientationchange',chk2)},chk=()=>{if(!OM.needRotate()){off();ok()}},chk2=()=>setTimeout(chk,400);
+ addEventListener('resize',chk);addEventListener('orientationchange',chk2);o.querySelector('button').onclick=()=>{off();back()};OM.lock();return off};
+
+/* ---------- phiên chơi dùng chung: bố cục + d-pad/joystick/gamepad + Skip + Pause ---------- */
+const insets=()=>{const e=document.createElement('div');e.style.cssText='position:fixed;left:0;top:0;visibility:hidden;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)';document.body.appendChild(e);const c=getComputedStyle(e),r={t:parseFloat(c.paddingTop)||0,r:parseFloat(c.paddingRight)||0,b:parseFloat(c.paddingBottom)||0,l:parseFloat(c.paddingLeft)||0};e.remove();return r};
+const KMV={ArrowLeft:1,ArrowRight:1,ArrowUp:1,ArrowDown:1,KeyW:1,KeyA:1,KeyS:1,KeyD:1,ShiftLeft:1,ShiftRight:1,KeyZ:1,KeyX:1,Space:1,Enter:1};
+/* o: {fw,fh (kích thước sân), buttons:[{k,label,color}], onPause,onResume,onRestart,onQuit,onSkip(ms)} */
+OM.session=function(o){
+ const S={keys:new Set,b:{},tx:0,ty:0,sk:null,paused:false,closed:false,gp:'',gpPrev:{}};
+ const touch=touchDev(),root=document.createElement('div');
+ root.style.cssText='position:fixed;inset:0;z-index:30;pointer-events:none;touch-action:none;-webkit-user-select:none;user-select:none';document.body.appendChild(root);
+ const op=K.op/100;
+ S.layout=()=>{const I=S.ins||(S.ins=insets()),land=innerWidth>=innerHeight*1.1,top=Math.max(I.t,typeof ST!=='undefined'?ST:0),m=6,fh0=innerHeight-top-m*2,
+  sc=land?Math.min(fh0/o.fh,innerWidth*.5/o.fw):Math.min(fh0/o.fh,(innerWidth-12)/o.fw),fw=o.fw*sc,fh=o.fh*sc,fx=(innerWidth-fw)/2,fy=top+(innerHeight-top-fh)/2;
+  const L={x0:I.l+8,x1:fx-10},R={x0:fx+fw+10,x1:innerWidth-I.r-8},pr=K.left?R:L,ar=K.left?L:R;
+  return S.lay={land,sc,fx,fy,fw,fh,top,I,L,R,pad:pr,act:ar,hud:{x:ar.x0,w:Math.max(0,ar.x1-ar.x0)}}};
+ /* --- dựng điều khiển --- */
+ let ps=0,cx=0,cy=0,pv,zone,btns={},pauseB,pid=null,ox=0,oy=0;const type=K.ctl;
+ const circ=(k,lab,col,hold)=>{const e=document.createElement('div');e.dataset.k=k;e.style.cssText='position:absolute;pointer-events:auto;border-radius:50%;background:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#333;font:bold 13px sans-serif;touch-action:none;box-sizing:border-box;opacity:'+op;e.style.border='5px solid '+col;e.innerHTML=lab;root.appendChild(e);
+  e.addEventListener('pointerdown',ev=>{ev.preventDefault();try{e.setPointerCapture(ev.pointerId)}catch(x){}if(hold)S.b[k]=1;else S.act(k);e.style.filter='brightness(.8)'});
+  if(hold)['pointerup','pointercancel','lostpointercapture'].forEach(n=>e.addEventListener(n,()=>{S.b[k]=0;e.style.filter=''}));else['pointerup','pointercancel'].forEach(n=>e.addEventListener(n,()=>{e.style.filter=''}));return e};
+ S.act=k=>{if(k==='skip')S.trySkip()};
+ S.trySkip=()=>{if(S.sk!=null&&!S.paused&&!S.closed){const t=S.sk;S.sk=null;if(S.skipEl)S.skipEl.style.display='none';o.onSkip&&o.onSkip(t)}};
+ const defs=(o.buttons||[{k:'f',label:'FOCUS',color:'#888'}]);
+ if(touch){
+  zone=document.createElement('div');zone.style.cssText='position:absolute;pointer-events:auto;touch-action:none';root.appendChild(zone);
+  pv=document.createElement('div');pv.style.cssText='position:absolute;pointer-events:none;opacity:'+op;root.appendChild(pv);
+  zone.addEventListener('pointerdown',e=>{if(pid!=null)return;e.preventDefault();pid=e.pointerId;try{zone.setPointerCapture(pid)}catch(x){}if(type==='float'){ox=e.clientX;oy=e.clientY;place(ox,oy)}else{ox=cx;oy=cy}upd(e)});
+  zone.addEventListener('pointermove',e=>{if(e.pointerId===pid){e.preventDefault();upd(e)}});
+  const rel=e=>{if(e.pointerId!==pid)return;pid=null;S.tx=S.ty=0;paint(0,0);if(type==='float')place(cx,cy)};['pointerup','pointercancel','lostpointercapture'].forEach(n=>zone.addEventListener(n,rel));
+  S.reset=()=>{pid=null;S.tx=S.ty=0;paint(0,0);if(type==='float')place(cx,cy)};
+  function place(x,y){pv.style.left=(x-ps/2)+'px';pv.style.top=(y-ps/2)+'px'}
+  function upd(e){const vx=e.clientX-ox,vy=e.clientY-oy,r=Math.hypot(vx,vy),R=ps/2;let x=0,y=0;
+   if(type==='stick'){const dz=R*.12;if(r>dz){const m=Math.min(1,(r-dz)/(R*.8-dz));x=vx/r*m;y=vy/r*m}}
+   else{const dz=type==='float'?12:R*.16;if(r>dz){const c=vx/r,s=vy/r;x=Math.abs(c)>.3827?Math.sign(c):0;y=Math.abs(s)>.3827?Math.sign(s):0}}
+   S.tx=x;S.ty=y;paint(x,y)}
+  function paint(x,y){if(type==='stick'){const k=pv.lastChild;if(k)k.style.transform='translate('+x*ps*.3+'px,'+y*ps*.3+'px)';return}
+   const on=(a,b)=>a?'#ff66aa':'#6a6a6a';const c=pv.children;if(c.length===4){c[0].style.background=on(y<0);c[1].style.background=on(x<0);c[2].style.background=on(x>0);c[3].style.background=on(y>0)}}
+  S.buildPad=()=>{pv.innerHTML='';if(type==='stick'){pv.style.cssText+=';border-radius:50%;background:rgba(255,255,255,.18);border:3px solid rgba(255,255,255,.45);box-sizing:border-box';pv.innerHTML='<div style="position:absolute;left:30%;top:30%;width:40%;height:40%;border-radius:50%;background:#ddd;border:3px solid #888;box-sizing:border-box"></div>'}
+   else{pv.style.background='none';pv.style.border='0';const u=ps*.31,g=ps*.035,sq=(l,t)=>'<div style="position:absolute;left:'+l+'px;top:'+t+'px;width:'+u+'px;height:'+u+'px;border-radius:'+u*.22+'px;background:#6a6a6a"></div>';
+    pv.innerHTML=sq(u+g,0)+sq(0,u+g)+sq(2*(u+g),u+g)+sq(u+g,2*(u+g))}}
+  for(const d of defs)btns[d.k]=circ(d.k,d.label,d.color||'#888',1);
+  S.skipEl=circ('skip','<span style="font-size:20px;line-height:1">»</span>SKIP','#18b218',0);S.skipEl.style.display='none';
+  S.layDom=()=>{const l=S.layout(),a=l.act,p=l.pad,pw=p.x1-p.x0,aw=a.x1-a.x0,H=innerHeight;ps=clamp(Math.min(pw-6,H*.5)*K.size/100,90,260);
+   cx=clamp(p.x0+pw/2,p.x0+ps/2,Math.max(p.x0+ps/2,p.x1-ps/2));cy=H-l.I.b-14-ps/2;
+   zone.style.left=p.x0+'px';zone.style.width=Math.max(40,pw)+'px';zone.style.top=H*.2+'px';zone.style.height=H*.8+'px';
+   pv.style.width=pv.style.height=ps+'px';S.buildPad();place(cx,cy);
+   const b=clamp(Math.min(aw*.4,H*.27)*K.size/100,54,124),pos=(i)=>i===0?[.68,.80,1]:i===1?[.36,.58,.8]:[.7,.46-.2*(i-2),.8];
+   defs.forEach((d,i)=>{const e=btns[d.k],q=pos(i),s=b*q[2];e.style.width=e.style.height=s+'px';e.style.left=(a.x0+aw*q[0]-s/2)+'px';e.style.top=(H*q[1]-s/2-(i===0?l.I.b*.3:0))+'px'});
+   const s=b*.78;S.skipEl.style.width=S.skipEl.style.height=s+'px';S.skipEl.style.left=(a.x0+aw*.3-s/2)+'px';S.skipEl.style.top=(H*.82-s/2-l.I.b*.3)+'px'};
+ }
+ /* nút Pause */
+ pauseB=document.createElement('div');pauseB.style.cssText='position:absolute;width:44px;height:44px;border-radius:50%;background:#fffd;border:3px solid #333;pointer-events:auto;display:flex;align-items:center;justify-content:center;touch-action:none;box-sizing:border-box';
+ pauseB.innerHTML='<svg viewBox="0 0 24 24" width="20" height="20"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z" fill="#222"/></svg>';root.appendChild(pauseB);pauseB.addEventListener('pointerdown',e=>{e.preventDefault();S.pause()});
+ S.layAll=()=>{const l=S.layout();if(S.layDom)S.layDom();pauseB.style.left=(l.pad.x0+4)+'px';pauseB.style.top=(l.top+8)+'px';if(o.onLayout)o.onLayout()};S.layAll();
+ /* --- phím + tay cầm --- */
+ S.kd=e=>{if(e.code==='Escape'){S.pause();return}if(KMV[e.code]){e.preventDefault();S.keys.add(e.code);if((e.code==='Space'||e.code==='Enter')&&!e.repeat)S.trySkip()}};
+ S.ku=e=>S.keys.delete(e.code);S.vis=()=>{if(document.hidden)S.pause()};S.rz=()=>{if(S.closed)return;S.ins=null;if(OM.needRotate()){S.pause();if(S.ov&&!S.rot){const c=S.ov.querySelector('[data-a=c]');if(c)c.click()}}else S.layAll()};
+ addEventListener('keydown',S.kd);addEventListener('keyup',S.ku);document.addEventListener('visibilitychange',S.vis);addEventListener('resize',S.rz);addEventListener('orientationchange',()=>setTimeout(S.rz,350));
+ S.read=()=>{const k=S.keys;let x=S.tx+((k.has('ArrowRight')||k.has('KeyD'))?1:0)-((k.has('ArrowLeft')||k.has('KeyA'))?1:0),y=S.ty+((k.has('ArrowDown')||k.has('KeyS'))?1:0)-((k.has('ArrowUp')||k.has('KeyW'))?1:0),f=!!S.b.f||k.has('ShiftLeft')||k.has('ShiftRight')||k.has('KeyZ')||k.has('KeyX');const b=Object.assign({},S.b);
+  try{const gs=navigator.getGamepads?navigator.getGamepads():[];S.gp='';for(const p of gs){if(!p||!p.connected)continue;S.gp=p.id;const ax=p.axes[0]||0,ay=p.axes[1]||0,m=Math.hypot(ax,ay);if(m>.18){const s=Math.min(1,(m-.18)/.7)/m;x+=ax*s;y+=ay*s}
+   const B=p.buttons,bp=i=>!!(B[i]&&B[i].pressed);x+=(bp(15)?1:0)-(bp(14)?1:0);y+=(bp(13)?1:0)-(bp(12)?1:0);if(bp(0)||bp(2)||bp(4)||bp(5)||bp(6)||bp(7))f=true;
+   const e=(i,fn)=>{const v=bp(i);if(v&&!S.gpPrev[i])fn();S.gpPrev[i]=v};e(3,S.trySkip);e(8,S.trySkip);e(1,S.trySkip);e(9,S.pause)}}catch(e){}
+  const m=Math.hypot(x,y);if(m>1){x/=m;y/=m}return{x,y,f,b}};
+ /* skip: mode gọi mỗi khung hình với mốc thời gian (ms) hoặc null */
+ S.setSkip=t=>{S.sk=t;if(S.skipEl){const d=t!=null?'flex':'none';if(S.skipEl.style.display!==d)S.skipEl.style.display=d}};
+ /* --- pause --- */
+ S.pause=()=>{if(S.paused||S.closed)return;S.paused=true;o.onPause&&o.onPause();S.tx=S.ty=0;S.b={};if(S.reset)S.reset();
+  const ov=document.createElement('div');ov.style.cssText='position:fixed;inset:0;z-index:40;background:#000a;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px;color:#fff;font:bold 20px sans-serif;padding:16px';
+  const bt=(t,c,bg)=>'<button data-a="'+c+'" style="background:'+bg+';color:#fff;border:0;border-radius:24px;padding:12px 30px;font:bold 17px sans-serif;min-width:170px">'+t+'</button>';
+  ov.innerHTML='<div style="width:100%;text-align:center">Tạm dừng</div>'+bt('Tiếp tục','c','#ff66aa')+bt('Chơi lại','r','#555')+bt('Thoát','q','#555');document.body.appendChild(ov);S.ov=ov;
+  ov.onclick=e=>{const a=e.target.dataset&&e.target.dataset.a;if(!a)return;
+   if(a==='c'){const go=()=>{ov.remove();S.ov=null;S.paused=false;o.onResume&&o.onResume()};if(OM.needRotate()){if(S.rot)return;S.rot=1;ov.style.display='none';OM.rotate(()=>{S.rot=0;ov.style.display='flex'},()=>{S.rot=0;S.close();o.onQuit&&o.onQuit()})}else go()}
+   else if(a==='r'){S.close();o.onRestart&&o.onRestart()}else{S.close();o.onQuit&&o.onQuit()}}};
+ S.close=()=>{if(S.closed)return;S.closed=true;removeEventListener('keydown',S.kd);removeEventListener('keyup',S.ku);document.removeEventListener('visibilitychange',S.vis);removeEventListener('resize',S.rz);if(S.ov)S.ov.remove();root.remove()};
+ return S};
+
+/* ---------- Cài đặt ---------- */
+const bt=(a,l,on)=>'<button class="mb" '+a+' style="width:auto;min-height:0;padding:6px 12px;'+(on?'background:#ff66aa;color:#fff':'')+'">'+l+'</button>';
+const row=(l,r)=>'<div class="sr"><span>'+l+'</span><span>'+r+'</span></div>';
+const slide=(l,a,v,mn,mx,st,u)=>'<div class="sr"><span>'+l+'</span><b data-omv="'+a+'">'+v+u+'</b></div><div class="sr"><input type="range" data-omr="'+a+'" data-u="'+u+'" min="'+mn+'" max="'+mx+'" step="'+st+'" value="'+v+'" style="flex:1"></div>';
+const inner=()=>{let h=OM.msg?'<div class="sr"><small style="color:#f88">'+OM.msg+'</small></div>':'';
+ const fs=K.files;if(!fs.length)h+='<div class="sr"><small style="opacity:.6">Chưa có chế độ nào. Chọn file .dll (ruleset osu!lazer) hoặc .js (adapter). Hiện có sẵn adapter cho: '+Object.keys(OM.adapters).map(k=>OM.adapters[k].name).join(', ')+'.</small></div>';
+ for(const f of fs){const ms=(f.modes||[]).map(m=>m.name).join(', ');h+='<div class="sr"><span><b>'+(ms||f.n)+'</b><br><small style="opacity:.6">'+f.n+(f.err?' · <span style="color:#f88">'+f.err+'</span>':'')+'</small></span><button class="mb" data-omx="'+encodeURIComponent(f.n)+'" style="width:auto;min-height:0;padding:6px 12px">Gỡ</button></div>'}
+ if(OM.list().length){
+  h+='<div class="sr"><b>Điều khiển chung (mọi chế độ thêm vào)</b></div>'+row('Kiểu',CTL.map(c=>bt('data-omg="ctl|'+c[0]+'"',c[1],K.ctl===c[0])).join(''))
+   +slide('Cỡ điều khiển','size',K.size,70,140,5,'%')+slide('Độ đậm nút','op',K.op,30,100,5,'%')+row('Tay trái (đổi bên d-pad/nút)',bt('data-omg="left|0"','Tắt',!K.left)+bt('data-omg="left|1"','Bật',!!K.left))
+   +'<div class="sr"><small style="opacity:.6">Tay cầm Bluetooth/USB tự nhận khi bấm một nút: cần/D-pad = di chuyển, A/X/LB/RB/LT/RT = Focus, Y/B/Select = Skip, Start = Pause. Bàn phím: mũi tên/WASD, Shift/Z/X, Space/Enter = Skip, Esc = Pause.</small></div>';
+  for(const m of OM.list()){const a=OM.adapters[m.id],c=OM.cfg(m.id);if(!a.settings||!a.settings.length)continue;h+='<div class="sr"><b>'+m.name+'</b></div>';
+   for(const s of a.settings){if(s.t==='range')h+=slide(s.label,'m|'+m.id+'|'+s.k,c[s.k],s.min,s.max,s.step||1,s.u||'');else h+=row(s.label,s.o.map((o,i)=>bt('data-oms="'+m.id+'|'+s.k+'|'+i+'"',o[0],c[s.k]===o[1])).join(''))}}}
+ return h};
+function refresh(){const e=document.getElementById('thx');if(e)e.innerHTML=inner()}
+OM.html=()=>'<div class="sr"><span>Thêm chế độ</span><label class="mb" style="width:auto;min-height:0;padding:8px 14px;cursor:pointer">+ Thêm file<input type="file" id="thf" accept=".dll,.js,application/octet-stream,text/javascript" style="display:none"></label></div><div id="thx">'+inner()+'</div>';
+document.addEventListener('change',e=>{const t=e.target;if(t.id==='thf'&&t.files[0]){OM.install(t.files[0]);t.value=''}});
+document.addEventListener('input',e=>{const t=e.target,a=t.dataset&&t.dataset.omr;if(!a)return;const v=+t.value;if(a.startsWith('m|')){const[,id,k]=a.split('|');OM.cfg(id)[k]=v}else K[a]=v;save();const l=document.querySelector('[data-omv="'+a+'"]');if(l)l.textContent=v+(t.dataset.u||'')});
+document.addEventListener('click',e=>{const t=e.target.closest&&e.target.closest('[data-omx],[data-omg],[data-oms]');if(!t)return;
+ if(t.dataset.omx)OM.remove(decodeURIComponent(t.dataset.omx));
+ else if(t.dataset.omg){const[k,v]=t.dataset.omg.split('|');K[k]=k==='ctl'?v:+v;save();refresh()}
+ else{const[id,k,i]=t.dataset.oms.split('|'),s=OM.adapters[id].settings.find(x=>x.k===k);OM.cfg(id)[k]=s.o[+i][1];save();refresh()}});
+
+/* ---------- cầu nối với script.js (tương thích TH.*) ---------- */
+const TH=window.TH={get on(){return!!OM.cur()},A:null,msg:''};
+TH.installed=()=>OM.list().length>0;
+TH.cur=OM.cur;TH.set=OM.set;window.thSet=v=>OM.set(v?(OM.list()[0]||{}).id:'');
+TH.icon=()=>{const m=OM.list().find(x=>x.id===OM.cur());return m&&m.icon||'assets/icon-play.png'};
+TH.btns=()=>OM.list().map(m=>'<button data-om="'+m.id+'" class="'+(OM.cur()===m.id?'on':'')+'" aria-label="'+m.name+'"><img src="'+(m.icon||'assets/icon-play.png')+'" alt=""></button>').join('');
+TH.support=M=>{const a=OM.adapters[OM.cur()];return a&&a.support?a.support(M):''};
+TH.html=OM.html;
+TH.start=async function(M,F,buf,bg,note){const id=OM.cur(),a=OM.adapters[id];
+ if(!a){select(CURID,'Chưa thêm chế độ');return}
+ await OM.ready;const A=OM.assets[id];if(!A){select(CURID,'Không nạp được tài nguyên của chế độ '+a.name);return}
+ const args=[M,F,buf,bg,note];
+ const ctx={M,F,buf,bg,note,A,cfg:OM.cfg(id),OM,restart:()=>TH.start(...args),quit:()=>{RP=null;REPMODS=null;select(CURID)}};
+ if(OM.needRotate()){OM.lock();return OM.rotate(()=>TH.start(...args),ctx.quit)}
+ OM.lock();try{await a.start(ctx)}catch(e){console.error(e);select(CURID,'Lỗi chế độ '+a.name+': '+(e.message||e))}};
+TH.ready=OM.ready;
+})();
